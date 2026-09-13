@@ -1,0 +1,240 @@
+name: BARSA SHOPI v10.0.0 FINAL BUILD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: barsa-shopi-v10-final-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize final version metadata
+        run: node scripts/normalize-version-lock.mjs
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK and emulator image
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "emulator" \
+            "system-images;android-34;google_apis;x86_64"
+
+      - name: Setup Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Install exact npm dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify dependency installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f node_modules/mediabunny/package.json
+          node -e "import('mediabunny').then(()=>console.log('mediabunny import OK'))"
+
+      - name: Prepare and verify runtime
+        run: npm run prepare:runtime && npm run verify:runtime
+
+      - name: Full JavaScript test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          npm test 2>&1 | tee reports/js-tests.log
+
+      - name: Source packaging security and release invariant gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          {
+            npm run check
+            npm run final:audit
+            npm run check:packaging
+            npm run check:release-invariants
+            npm audit --omit=dev --audit-level=critical
+            npm audit --omit=dev --audit-level=moderate --json > reports/npm-audit.json
+          } 2>&1 | tee reports/release-gates.log
+
+      - name: Deterministic mobile offline UI verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          npx playwright install --with-deps chromium 2>&1 | tee reports/playwright-install.log
+          node tests/e2e-mobile-smoke.mjs 2>&1 | tee reports/mobile-smoke.log
+
+      - name: Build and sync web runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build 2>&1 | tee reports/web-build.log
+          node scripts/sync-android.mjs 2>&1 | tee reports/android-sync.log
+
+      - name: Android lint and unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android :app:lintDebug :app:lintRelease :app:testDebugUnitTest --stacktrace --no-daemon 2>&1 | tee reports/android-lint-unit.log
+
+      - name: Build debug and release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android :app:assembleDebug :app:assembleRelease --stacktrace --no-daemon 2>&1 | tee reports/android-assemble.log
+
+      - name: Enable KVM for Android emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Boot emulator and execute real app-launch script
+        id: coldstart
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/android-coldstart-gate.sh
+          scripts/android-coldstart-gate.sh
+
+      - name: Validate cold-start gate result
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f reports/android-emulator-booted.txt
+          test -f reports/android-script-entered.txt
+          test -f reports/android-apk-installed.txt
+          for PASS in 1 2 3; do
+            test -f "reports/android-launch-${PASS}-pid.txt"
+          done
+          test -f reports/android-logcat-captured.txt
+          test -s reports/android-logcat.txt
+          test -s reports/android-meminfo.txt
+          grep -qx 'PASSED' reports/android-coldstart-gate.txt
+          if grep -E "FATAL EXCEPTION|ANR in com\.barsa\.shopi|am_crash.*com\.barsa\.shopi|Process com\.barsa\.shopi .* has died" reports/android-logcat.txt; then
+            echo 'FAIL: crash/ANR signature found in captured logcat' | tee reports/android-coldstart-summary.txt
+            exit 1
+          fi
+          echo 'PASS: EMULATOR_BOOTED -> SCRIPT_ENTERED -> APK_INSTALLED -> LAUNCH_1/2/3_PID -> LOGCAT_CAPTURED -> PASSED' | tee reports/android-coldstart-summary.txt
+
+      - name: Collect sign and verify APKs
+        shell: bash
+        env:
+          SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p final/reports
+          DEBUG_APK="$(find android/app/build/outputs/apk/debug -name '*.apk' | head -n 1)"
+          RELEASE_APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+          test -s "$DEBUG_APK"
+          test -s "$RELEASE_APK"
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+
+          cp "$RELEASE_APK" final/BARSA-SHOPI-v10.0.0-FINAL-release-unsigned.apk
+          "$BT/zipalign" -f -p 4 "$RELEASE_APK" final/release-aligned.apk
+
+          SIGNING_MODE="debug-fallback"
+          if [[ -n "${SIGNING_KEY_STORE_BASE64:-}" && -n "${SIGNING_KEY_ALIAS:-}" && -n "${SIGNING_STORE_PASSWORD:-}" ]]; then
+            printf '%s' "$SIGNING_KEY_STORE_BASE64" | base64 --decode > final/release-keystore.jks
+            export BARSA_STORE_PASS="$SIGNING_STORE_PASSWORD"
+            export BARSA_KEY_PASS="${SIGNING_KEY_PASSWORD:-$SIGNING_STORE_PASSWORD}"
+            "$BT/apksigner" sign \
+              --ks final/release-keystore.jks \
+              --ks-key-alias "$SIGNING_KEY_ALIAS" \
+              --ks-pass env:BARSA_STORE_PASS \
+              --key-pass env:BARSA_KEY_PASS \
+              --out final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk \
+              final/release-aligned.apk
+            SIGNING_MODE="production-secret"
+            rm -f final/release-keystore.jks
+          else
+            cp "$DEBUG_APK" final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk
+          fi
+
+          test -s final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk
+          "$BT/zipalign" -c -v 4 final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk > final/reports/zipalign.txt
+          "$BT/apksigner" verify --verbose --print-certs final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk > final/reports/apksigner.txt
+          "$BT/aapt" dump badging final/BARSA-SHOPI-v10.0.0-FINAL-installable.apk > final/reports/badging.txt
+          grep -q "package: name='com.barsa.shopi'" final/reports/badging.txt
+          grep -q "versionName='10.0.0'" final/reports/badging.txt
+          sha256sum final/*.apk > final/reports/SHA256SUMS.txt
+          printf '%s\n' "$SIGNING_MODE" > final/reports/signing-mode.txt
+          cp reports/* final/reports/ 2>/dev/null || true
+          cp reports/npm-audit.json final/reports/ 2>/dev/null || true
+          cp android/app/build/reports/lint-results-debug.html final/reports/ 2>/dev/null || true
+          cp android/app/build/reports/lint-results-release.html final/reports/ 2>/dev/null || true
+          git archive --format=zip --output=final/BARSA-SHOPI-v10.0.0-FINAL-source.zip HEAD
+          zip -u final/BARSA-SHOPI-v10.0.0-FINAL-source.zip package-lock.json
+          printf 'BARSA SHOPI v10.0.0 FINAL\nInstallable APK: BARSA-SHOPI-v10.0.0-FINAL-installable.apk\nUnsigned release APK: BARSA-SHOPI-v10.0.0-FINAL-release-unsigned.apk\nAndroid emulator is booted directly by shell; release requires EMULATOR_BOOTED, SCRIPT_ENTERED, APK_INSTALLED, 3 live PID markers, LOGCAT_CAPTURED and PASSED.\nSigning mode is recorded in reports/signing-mode.txt.\nSource, lint, audit, startup, APK signature and SHA256 reports are included.\n' > final/README-FIRST.txt
+          rm -f final/release-aligned.apk
+
+      - name: Build one downloadable final ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd final
+          zip -r ../BARSA-SHOPI-v10.0.0-FINAL.zip .
+          cd ..
+          test -s BARSA-SHOPI-v10.0.0-FINAL.zip
+          unzip -t BARSA-SHOPI-v10.0.0-FINAL.zip
+          sha256sum BARSA-SHOPI-v10.0.0-FINAL.zip > BARSA-SHOPI-v10.0.0-FINAL.zip.sha256
+
+      - name: Upload complete final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BARSA-SHOPI-v10.0.0-FINAL
+          path: |
+            BARSA-SHOPI-v10.0.0-FINAL.zip
+            BARSA-SHOPI-v10.0.0-FINAL.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BARSA-SHOPI-v10.0.0-DIAGNOSTICS-${{ github.run_number }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14

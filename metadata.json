@@ -1,0 +1,6 @@
+{
+  "name": "BARSA SHOPI",
+  "description": "BARSA SHOPI professional Android AI video enhancement engine with native acceleration and MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
